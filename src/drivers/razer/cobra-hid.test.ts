@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { RAZER_READ, encodeRazerRequest, razerSetDpiCommand, razerSetExtendedEffectCommand, razerSetLegacyPollingCommand } from "@openmouse/protocol/razer";
+import { RAZER_LED, RAZER_READ, decodeBacklightBrightness, encodeRazerRequest, razerReadExtendedBrightnessCommand, razerSetDpiCommand, razerSetExtendedBrightnessCommand, razerSetExtendedEffectCommand, razerSetLegacyPollingCommand } from "@openmouse/protocol/razer";
 import {
   COBRA_DPI_READ,
   COBRA_EFFECT_TRANSACTION_ID,
@@ -60,6 +60,30 @@ test("Cobra effects match openrazer's extended matrix payloads", () => {
     assert.equal(command.dataSize, dataSize);
     assert.deepEqual(command.args, args);
     assert.equal(packet[1], 0x1f);
+  }
+});
+
+test("Cobra brightness writes and reads the logo led on the effect transaction id", () => {
+  const write = encodeRazerRequest(razerSetExtendedBrightnessCommand(RAZER_LED.logo, 50), COBRA_EFFECT_TRANSACTION_ID);
+  assert.equal(write[1], 0x1f);
+  assert.equal(write[6], 0x0f);
+  assert.equal(write[7], 0x04);
+  // [storage = VARSTORE, logo led, level], with 50% scaled onto the 0-255 command.
+  assert.deepEqual([...write.slice(8, 11)], [0x01, 0x04, 0x80]);
+
+  const read = encodeRazerRequest(razerReadExtendedBrightnessCommand(RAZER_LED.logo), COBRA_EFFECT_TRANSACTION_ID);
+  assert.equal(read[1], 0x1f);
+  assert.equal(read[6], 0x0f);
+  assert.equal(read[7], 0x84);
+  assert.deepEqual([...read.slice(8, 10)], [0x01, 0x04]);
+});
+
+test("Cobra brightness offers off and round-trips whole percents", () => {
+  for (const percent of [0, 25, 50, 75, 100]) {
+    const command = razerSetExtendedBrightnessCommand(RAZER_LED.logo, percent);
+    // The reply carries [storage, led, level] and the decoder reads the level.
+    const reply = Uint8Array.from([0x01, 0x04, command.args?.[2] ?? 0xff]);
+    assert.equal(decodeBacklightBrightness(reply), percent);
   }
 });
 

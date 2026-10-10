@@ -2,19 +2,23 @@ import type { MouseLighting, MouseStatus } from "../mouse-types.ts";
 import { VENDOR_ID } from "../vendors.ts";
 import { openRazerDevice } from "./hid-open.ts";
 import {
+  RAZER_LED,
   RAZER_READ,
   RAZER_REPORT_ID,
   RAZER_STATUS,
   RAZER_TRANSACTION_ID_1F,
   RAZER_TRANSACTION_ID_FF,
   RazerProtocolError,
+  decodeBacklightBrightness,
   decodeDpi,
   decodeFirmwareVersion,
   decodeLegacyPollingRate,
   decodeRazerResponse,
   decodeSerial,
   encodeRazerRequest,
+  razerReadExtendedBrightnessCommand,
   razerSetDpiCommand,
+  razerSetExtendedBrightnessCommand,
   razerSetExtendedEffectCommand,
   razerSetLegacyPollingCommand,
   type RazerCommand,
@@ -61,6 +65,18 @@ const COBRA_COLOR_MODES = ["Static", "Reactive", "Breathing single", "Breathing 
 const COBRA_DUAL_COLOR_MODES = ["Breathing dual"] as const satisfies readonly MouseLighting["modes"][number][];
 const COBRA_REACTIVE_MODES = ["Reactive"] as const satisfies readonly MouseLighting["modes"][number][];
 const COBRA_REACTIVE_SPEEDS = [1, 2, 3, 4] as const;
+
+/**
+ * Brightness levels the lighting card offers. Razer's command accepts any
+ * whole percent from 0 to 255, so every step from 0-100 is a valid, genuine
+ * lighting level (0 turns the LEDs off). Listing them all makes the card render
+ * a continuous slider instead of a handful of presets, which matters for dimming
+ * a bright logo below its lowest preset. Writes go through the mouse's own
+ * persistent store (VARSTORE), which makes brightness the lighting setting a
+ * Razer mouse keeps on board — set it once and it follows the mouse to any
+ * computer.
+ */
+const COBRA_BRIGHTNESS_LEVELS: readonly number[] = Array.from({ length: 101 }, (_, level) => level);
 
 /**
  * Lighting writes answer on the extended-matrix `0x1f` transaction id, unlike
@@ -182,6 +198,7 @@ export class RazerCobraHidClient {
     const serial = await this.once("serial", () => this.request(RAZER_READ.serial).catch(() => null));
     const dpi = decodeDpi(await this.request(COBRA_DPI_READ));
     const pollingRateHz = decodeLegacyPollingRate(await this.request(RAZER_READ.pollingRate));
+    const lighting = await this.readLighting();
     return {
       brand: "Razer",
       name: this.displayName(),
@@ -210,7 +227,7 @@ export class RazerCobraHidClient {
       unitId: serial ? decodeSerial(serial) : null,
       liftOffDistance: null,
       supportedLiftOffDistances: [],
-      lighting: this.lightingFromCache(),
+      lighting,
       firmware: [`Mouse ${decodeFirmwareVersion(firmware)}`],
     };
   }
@@ -243,9 +260,11 @@ export class RazerCobraHidClient {
   }
 
   /**
-   * Writes a lighting zone. The effect commands have no read back, so unlike
-   * DPI and polling there is nothing to confirm against; the value written is
-   * cached and returned as the current state.
+   * Writes a lighting zone's effect and, when it changed, its brightness.
+   * Effects have no read back, so what was written is cached and returned as
+   * the current state; brightness can be read, and is confirmed like DPI and
+   * polling. Both go to the mouse's persistent store, so the effect and the
+   * brightness the user settles on outlive the browser session and the machine.
    */
   async setLighting(lighting: MouseLighting): Promise<MouseLighting> {
     await this.open();
@@ -261,8 +280,43 @@ export class RazerCobraHidClient {
     if (lighting.color !== null) options.color = lighting.color;
     if (lighting.color2 !== null) options.color2 = lighting.color2;
     if (lighting.speed !== null) options.speed = lighting.speed as RazerReactiveSpeed;
+    const previous = this.lightingFromCache();
     await this.request(razerSetExtendedEffectCommand(effect, options), COBRA_EFFECT_TRANSACTION_ID);
-    this.lighting = { ...lighting };
+    // Cached before the brightness step so a refused brightness cannot leave
+    // the panel showing an effect the mouse is no longer running.
+    this.lighting = { ...lighting, brightness: previous.brightness };
+    if (lighting.brightness != null && lighting.brightness !== previous.brightness) {
+      await this.request(
+        razerSetExtendedBrightnessCommand(RAZER_LED.logo, lighting.brightness),
+        COBRA_EFFECT_TRANSACTION_ID,
+      );
+      const confirmed = decodeBacklightBrightness(
+        await this.request(razerReadExtendedBrightnessCommand(RAZER_LED.logo), COBRA_EFFECT_TRANSACTION_ID),
+      );
+      if (confirmed !== lighting.brightness) {
+        throw new Error(`The mouse kept ${confirmed}% brightness instead of ${lighting.brightness}%.`);
+      }
+      this.lighting = { ...this.lighting, brightness: confirmed };
+    }
+    return this.lighting;
+  }
+
+  /**
+   * The cached effect plus the brightness the logo led reports. The effect has
+   * no read, so only brightness is refreshed from the mouse; a read that fails
+   * hides the brightness row while leaving the effects offered.
+   */
+  private async readLighting(): Promise<MouseLighting> {
+    const reply = await this.request(
+      razerReadExtendedBrightnessCommand(RAZER_LED.logo),
+      COBRA_EFFECT_TRANSACTION_ID,
+    ).catch(() => null);
+    const brightness = reply ? decodeBacklightBrightness(reply) : null;
+    this.lighting = {
+      ...this.lightingFromCache(),
+      brightness,
+      brightnessLevels: brightness === null ? [] : COBRA_BRIGHTNESS_LEVELS,
+    };
     return this.lighting;
   }
 
@@ -278,6 +332,7 @@ export class RazerCobraHidClient {
       reactiveModes: COBRA_REACTIVE_MODES,
       speeds: COBRA_REACTIVE_SPEEDS,
       speed: null,
+      brightness: null,
       writeOnly: true,
     };
     return this.lighting;
